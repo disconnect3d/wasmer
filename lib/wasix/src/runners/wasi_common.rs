@@ -9,10 +9,7 @@ use futures::future::BoxFuture;
 use virtual_fs::{FileSystem, FsError, OverlayFileSystem, RootFileSystemBuilder, TmpFileSystem};
 use webc::metadata::annotations::Wasi as WasiAnnotation;
 
-use crate::{
-    bin_factory::BinaryPackage, capabilities::Capabilities, runners::MountedDirectory,
-    WasiEnvBuilder,
-};
+use crate::{bin_factory::BinaryPackage, capabilities::Capabilities, WasiEnvBuilder};
 
 #[derive(Debug, Clone)]
 pub struct MappedCommand {
@@ -43,7 +40,7 @@ impl CommonWasiOptions {
         root_fs: Option<TmpFileSystem>,
     ) -> Result<(), anyhow::Error> {
         let root_fs = root_fs.unwrap_or_else(|| RootFileSystemBuilder::default().build());
-        let fs = prepare_filesystem(root_fs, &self.mounts, container_fs, builder)?;
+        let fs = prepare_filesystem(root_fs, &self.mounts, container_fs)?;
 
         builder.add_preopen_dir("/")?;
 
@@ -107,7 +104,6 @@ impl CommonWasiOptions {
 //     OverlayFileSystem<TmpFileSystem, [RelativeOrAbsolutePathHack<Arc<dyn FileSystem>>; 1]>;
 
 fn build_directory_mappings(
-    builder: &mut WasiEnvBuilder,
     root_fs: &mut TmpFileSystem,
     mounted_dirs: &[MountedDirectory],
 ) -> Result<(), anyhow::Error> {
@@ -159,10 +155,9 @@ fn prepare_filesystem(
     mut root_fs: TmpFileSystem,
     mounted_dirs: &[MountedDirectory],
     container_fs: Option<Arc<dyn FileSystem + Send + Sync>>,
-    builder: &mut WasiEnvBuilder,
 ) -> Result<Box<dyn FileSystem + Send + Sync>, Error> {
     if !mounted_dirs.is_empty() {
-        build_directory_mappings(builder, &mut root_fs, mounted_dirs)?;
+        build_directory_mappings(&mut root_fs, mounted_dirs)?;
     }
 
     // HACK(Michael-F-Bryan): The WebcVolumeFileSystem only accepts relative
@@ -228,6 +223,46 @@ fn create_dir_all(fs: &dyn FileSystem, path: &Path) -> Result<(), Error> {
     fs.create_dir(path)?;
 
     Ok(())
+}
+
+/// A directory that should be mapped from the host filesystem into a WASI
+/// instance (the "guest").
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MappedDirectory {
+    /// The absolute path for a directory on the host filesystem.
+    pub host: std::path::PathBuf,
+    /// The absolute path specifying where the host directory should be mounted
+    /// inside the guest.
+    pub guest: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct MountedDirectory {
+    pub guest: String,
+    pub fs: Arc<dyn FileSystem + Send + Sync>,
+}
+
+impl From<MappedDirectory> for MountedDirectory {
+    fn from(value: MappedDirectory) -> Self {
+        let MappedDirectory { host, guest } = value;
+
+        // HACK: We don't have a FileSystem implementation that lets you mount
+        // just a single folder, so we're going to work around that using a mem
+        // fs and its mounting infrastructure.
+        let host_fs = Arc::new(crate::default_fs_backing()) as Arc<dyn FileSystem + Send + Sync>;
+        let temp_fs = virtual_fs::mem_fs::FileSystem::default();
+        if let Some(parent) = Path::new(&guest).parent() {
+            create_dir_all(&temp_fs, parent).unwrap();
+        }
+        temp_fs
+            .mount(PathBuf::from(&guest), &host_fs, host)
+            .unwrap();
+
+        MountedDirectory {
+            guest,
+            fs: Arc::new(temp_fs),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -381,11 +416,9 @@ mod tests {
         })];
         let container = Container::from_bytes(PYTHON).unwrap();
         let webc_fs = WebcVolumeFileSystem::mount_all(&container);
-        let mut builder = WasiEnvBuilder::new("");
 
         let root_fs = RootFileSystemBuilder::default().build();
-        let fs =
-            prepare_filesystem(root_fs, &mapping, Some(Arc::new(webc_fs)), &mut builder).unwrap();
+        let fs = prepare_filesystem(root_fs, &mapping, Some(Arc::new(webc_fs))).unwrap();
 
         assert!(fs.metadata("/home/file.txt".as_ref()).unwrap().is_file());
         assert!(fs.metadata("lib".as_ref()).unwrap().is_dir());

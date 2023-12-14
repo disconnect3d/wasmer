@@ -204,7 +204,7 @@ impl Config {
     }
 
     pub fn map_directory(&mut self, dir: MappedDirectory) -> &mut Self {
-        self.wasi.mapped_dirs.push(dir);
+        self.wasi.mounts.push(dir.into());
         self
     }
 
@@ -212,7 +212,9 @@ impl Config {
         &mut self,
         mappings: impl IntoIterator<Item = MappedDirectory>,
     ) -> &mut Self {
-        self.wasi.mapped_dirs.extend(mappings.into_iter());
+        for mapping in mappings {
+            self.map_directory(mapping);
+        }
         self
     }
 
